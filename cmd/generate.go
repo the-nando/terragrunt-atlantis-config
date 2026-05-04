@@ -1,42 +1,103 @@
 package cmd
 
 import (
-	"github.com/gruntwork-io/terragrunt/util"
+	"context"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
-
-	"github.com/hashicorp/go-getter"
-	log "github.com/sirupsen/logrus"
+	"strings"
+	"sync"
 
 	"github.com/ghodss/yaml"
 	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/options"
+	"github.com/gruntwork-io/terragrunt/util"
+	"github.com/hashicorp/go-getter"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
-
-	"context"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
-	"sync"
 )
 
-// Parse env vars into a map
+// projectDirNameSanitizer normalizes Atlantis project/workspace names from directory paths.
+var projectDirNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// windowsDriveLetterRx matches a Windows absolute path prefix after go-getter normalization.
+var windowsDriveLetterRx = regexp.MustCompile(`^[A-Za-z]:`)
+
+var processEnvOnce sync.Once
+var processEnvMap map[string]string
+
+// getEnvs returns a snapshot of the process environment (built once per run; Terragrunt expects a map).
 func getEnvs() map[string]string {
-	envs := os.Environ()
-	m := make(map[string]string)
+	processEnvOnce.Do(func() {
+		m := make(map[string]string, len(os.Environ()))
+		for _, env := range os.Environ() {
+			key, value, ok := strings.Cut(env, "=")
+			if ok {
+				m[key] = value
+			} else {
+				m[key] = ""
+			}
+		}
+		processEnvMap = m
+	})
+	return processEnvMap
+}
 
-	for _, env := range envs {
-		results := strings.Split(env, "=")
-		m[results[0]] = results[1]
+type getterDetectCache struct {
+	mtx  sync.RWMutex
+	data map[string]string
+}
+
+func (c *getterDetectCache) get(source, dir string) (string, bool) {
+	c.mtx.RLock()
+	defer c.mtx.RUnlock()
+	v, ok := c.data[source+"\x00"+dir]
+	return v, ok
+}
+
+func (c *getterDetectCache) set(source, dir, parsed string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.data == nil {
+		c.data = make(map[string]string)
 	}
+	c.data[source+"\x00"+dir] = parsed
+}
 
-	return m
+var getterDetectMemo getterDetectCache
+
+func getterDetectCached(source, dir string) (string, error) {
+	if parsed, ok := getterDetectMemo.get(source, dir); ok {
+		return parsed, nil
+	}
+	parsed, err := getter.Detect(source, dir, getter.Detectors)
+	if err != nil {
+		return "", err
+	}
+	getterDetectMemo.set(source, dir, parsed)
+	return parsed, nil
+}
+
+// pathWithinOrEqualDir reports whether filePath is dir or a path inside dir (proper subtree).
+func pathWithinOrEqualDir(dir, filePath string) bool {
+	dir = filepath.Clean(dir)
+	filePath = filepath.Clean(filePath)
+	rel, err := filepath.Rel(dir, filePath)
+	if err != nil {
+		return false
+	}
+	if rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // Terragrunt imports can be relative or absolute
@@ -146,7 +207,6 @@ func getDependencies(ctx *config.ParsingContext, path string) ([]string, error) 
 		dependencies := []string{}
 		if len(includes) > 0 {
 			for _, includeDep := range includes {
-				getDependenciesCache.set(includeDep.Path, getDependenciesOutput{nil, err})
 				dependencies = append(dependencies, includeDep.Path)
 			}
 		}
@@ -188,16 +248,13 @@ func getDependencies(ctx *config.ParsingContext, path string) ([]string, error) 
 			source := parsedConfig.Terraform.Source
 
 			// Use `go-getter` to normalize the source paths
-			parsedSource, err := getter.Detect(*source, filepath.Dir(path), getter.Detectors)
+			parsedSource, err := getterDetectCached(*source, filepath.Dir(path))
 			if err != nil {
 				return nil, err
 			}
 
 			// Check if the path begins with a drive letter, denoting Windows
-			isWindowsPath, err := regexp.MatchString(`^[A-Za-z]:`, parsedSource)
-			if err != nil {
-				return nil, err
-			}
+			isWindowsPath := windowsDriveLetterRx.MatchString(parsedSource)
 
 			// If the normalized source begins with `file://`, or matched the Windows drive letter check, it is a local path
 			if strings.HasPrefix(parsedSource, "file://") || isWindowsPath {
@@ -418,8 +475,7 @@ func createProject(ctx context.Context, sourcePath string) (*AtlantisProject, er
 	// It is not clear from documentation whether the normal workspaces have those limitations
 	// However a workspace 97 chars long has been working perfectly.
 	// We are going to use the same name for both workspace & project name as it is unique.
-	regex := regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-	projectName := regex.ReplaceAllString(project.Dir, "_")
+	projectName := projectDirNameSanitizer.ReplaceAllString(project.Dir, "_")
 
 	if createProjectName {
 		project.Name = projectName
@@ -562,8 +618,7 @@ func createHclProject(ctx context.Context, sourcePaths []string, workingDir stri
 	// It is not clear from documentation whether the normal workspaces have those limitations
 	// However a workspace 97 chars long has been working perfectly.
 	// We are going to use the same name for both workspace & project name as it is unique.
-	regex := regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-	projectName := regex.ReplaceAllString(project.Dir, "_")
+	projectName := projectDirNameSanitizer.ReplaceAllString(project.Dir, "_")
 
 	if createProjectName {
 		project.Name = projectName
@@ -634,9 +689,7 @@ func getAllTerragruntFiles(path string) ([]string, error) {
 func FindConfigFilesInPath(rootPath string, opts *options.TerragruntOptions) ([]string, error) {
 	configFiles := []string{}
 
-	walkFunc := filepath.Walk
-
-	err := walkFunc(rootPath, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -659,35 +712,49 @@ func FindConfigFilesInPath(rootPath string, opts *options.TerragruntOptions) ([]
 		return nil
 	})
 
-	nestedConfigFiles, err := config.FindConfigFilesInPath(rootPath, opts)
-	if err == nil {
-		configFiles = append(configFiles, nestedConfigFiles...)
+	if walkErr != nil {
+		return configFiles, walkErr
 	}
+
+	nestedConfigFiles, err := config.FindConfigFilesInPath(rootPath, opts)
+	if err != nil {
+		return configFiles, err
+	}
+	configFiles = append(configFiles, nestedConfigFiles...)
 	return configFiles, nil
 }
 
 // Finds the absolute paths of all arbitrary project hcl files
 func getAllTerragruntProjectHclFiles() map[string][]string {
-	projectHclFiles := projectHclFiles
-	orderedHclFilePaths := map[string][]string{}
-	uniqueHclFileAbsPaths := map[string][]string{}
-	for _, projectHclFile := range projectHclFiles {
-		err := filepath.Walk(gitRoot, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
+	wantName := make(map[string]struct{}, len(projectHclFiles))
+	for _, name := range projectHclFiles {
+		wantName[name] = struct{}{}
+	}
+	orderedHclFilePaths := make(map[string][]string, len(projectHclFiles))
+	for _, name := range projectHclFiles {
+		orderedHclFilePaths[name] = nil
+	}
 
-			if !info.IsDir() && info.Name() == projectHclFile {
-				orderedHclFilePaths[projectHclFile] = append(orderedHclFilePaths[projectHclFile], filepath.Dir(path))
-			}
-
-			return nil
-		})
-
+	err := filepath.WalkDir(gitRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if _, ok := wantName[name]; !ok {
+			return nil
+		}
+		orderedHclFilePaths[name] = append(orderedHclFilePaths[name], filepath.Dir(path))
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	uniqueHclFileAbsPaths := make(map[string][]string, len(projectHclFiles))
+	for _, projectHclFile := range projectHclFiles {
 		for _, uniquePath := range orderedHclFilePaths[projectHclFile] {
 			uniqueAbsPath, err := filepath.Abs(uniquePath)
 			if err != nil {
@@ -766,7 +833,7 @@ func main(cmd *cobra.Command, args []string) error {
 				skipProject := false
 				if createHclProjectExternalChilds && workingDir == gitRoot && len(projectHclDirs) > 0 {
 					for _, projectHclDir := range projectHclDirs {
-						if strings.HasPrefix(terragruntPath, projectHclDir) {
+						if pathWithinOrEqualDir(projectHclDir, terragruntPath) {
 							skipProject = true
 							break
 						}
@@ -785,14 +852,16 @@ func main(cmd *cobra.Command, args []string) error {
 					if err != nil {
 						return err
 					}
-					// if project and err are nil then skip this project
-					if err == nil && project == nil {
+					// if project is nil then skip this project
+					if project == nil {
 						return nil
 					}
 
 					// When preserving existing projects, we should update existing blocks instead of creating a
 					// duplicate, when generating something which already has representation
 					if preserveProjects {
+						lock.Lock()
+						defer lock.Unlock()
 						updateProject := false
 
 						// TODO: with Go 1.19, we can replace for loop with slices.IndexFunc for increased performance
@@ -838,8 +907,8 @@ func main(cmd *cobra.Command, args []string) error {
 				if err != nil {
 					return err
 				}
-				// if project and err are nil then skip this project
-				if err == nil && project == nil {
+				// if project is nil then skip this project
+				if project == nil {
 					return nil
 				}
 				// Lock the list as only one goroutine should be writing to config.Projects at a time
@@ -942,7 +1011,9 @@ func main(cmd *cobra.Command, args []string) error {
 
 	// Write output
 	if len(outputPath) != 0 {
-		os.WriteFile(outputPath, []byte(yamlString), 0644)
+		if err := os.WriteFile(outputPath, []byte(yamlString), 0644); err != nil {
+			return err
+		}
 	} else {
 		log.Println(yamlString)
 	}
