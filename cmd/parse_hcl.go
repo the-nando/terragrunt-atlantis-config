@@ -148,6 +148,15 @@ func parseModule(ctx *config.ParsingContext, path string) (isParent bool, includ
 		return false, terragruntIncludeList, nil
 	}
 
+	// A file named `root.hcl` is the root/parent config by the modern Terragrunt
+	// convention. Children reference it via `find_in_parent_folders("root.hcl")` and
+	// inherit its settings (including any `terraform { source }` block defined for them
+	// to share). Treat it as a parent even when it defines a source, otherwise the source
+	// check below would misclassify it as a leaf module and emit a spurious project for it.
+	if filepath.Base(path) == "root.hcl" {
+		return true, nil, nil
+	}
+
 	// We don't need to check the errors/diagnostics coming from `decodeHcl`, as when errors come up,
 	// it will leave the partially parsed result in the output object.
 	var parsed parsedHcl
